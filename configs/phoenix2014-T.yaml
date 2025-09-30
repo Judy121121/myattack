@@ -1,0 +1,5 @@
+dataset_root: /media/cv3/store1/postgraduate/y2023/WLF/datasets/PHOENIX-2014-T
+dict_path: ./preprocess/phoenix2014-T/gloss_dict.npy
+evaluation_dir: ./evaluation/slr_eval
+evaluation_prefix: phoenix2014-T-groundtruth
+

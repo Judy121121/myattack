@@ -1,0 +1,5 @@
+dataset_root: /media/cv3/store1/postgraduate/y2023/WLF/datasets/phoenix2014/phoenix-2014-multisigner
+#dataset_root: /media/cv3/store1/postgraduate/y2023/WLF/datasets/ph_adv/PGD
+dict_path: ./preprocess/phoenix2014/gloss_dict.npy
+evaluation_dir: ./evaluation/slr_eval
+evaluation_prefix: phoenix2014-groundtruth
