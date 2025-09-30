@@ -1,0 +1,373 @@
+这是一个用于测试生成稀疏对抗样本的代码，是EGS_TSSA方法的测试部分。我会逐行详细解释这个代码：
+
+1. 导入库和设置参数
+Python
+import argparse
+import os
+import numpy as np
+import torchvision
+import torch
+from torch.utils.data import DataLoader
+import torchvision.datasets as datasets
+import torchvision.transforms as transforms
+import torchvision.utils as vutils
+import torch.nn.functional as F
+from test_generators import GeneratorResnet  # 自定义生成器模型
+
+# 命令行参数解析
+parser = argparse.ArgumentParser(description='testing EGS_TSSA for generating sparse adversarial examples')
+parser.add_argument('--test_dir', default='/media/cv3/store2/imagenet/', help='path to imagenet testing set')
+parser.add_argument('--model_type', type=str, default='res50', help='Model against GAN is tested: incv3, res50')
+parser.add_argument('--model_t', type=str, default='vgg16', help='Model')  # 转移攻击的目标模型
+parser.add_argument('--eps', type=int, default=10, help='Perturbation Budget')  # 扰动预算
+parser.add_argument('--target', type=int, default=-1, help='-1 if untargeted')  # 目标攻击类别
+parser.add_argument('--batch_size', type=int, default=1, help='Number of testig samples/batch')
+parser.add_argument('--checkpoint', type=str, default='weights/soft_eps255_res50_tk0.873.pth', help='path to checkpoint')  # 生成器权重
+parser.add_argument('--tk', type=float, default=0.873, help='path to checkpoint')  # TopK比例
+
+if __name__ == '__main__':
+    args = parser.parse_known_args()[0]
+    eps = args.eps
+    tk = args.tk
+    choose = [0., 0.6]  # 备选的区域选择区间
+    print('eps:', eps)
+    # 设备设置
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+2. 梯度钩子函数
+Python
+    # 用于存储梯度和特征的全局变量
+    back_fea = torch.tensor([]).to(device)
+    back_grad = torch.tensor([]).to(device)
+
+    # 梯度钩子函数 - 获取反向传播的梯度
+    def backward_hook(module, grad_in, grad_out):
+        global back_grad
+        back_grad = grad_out[0].clone().detach()  # 捕获并保存梯度
+
+    # 特征钩子函数 - 获取前向传播的特征
+    def forward_hook(module, input, output):
+        global back_fea
+        back_fea = output.detach()  # 捕获并保存特征
+3. 模型加载和设置
+Python
+    # 加载目标模型（白盒模型）
+    if args.model_type == 'incv3':
+        model = torchvision.models.inception_v3(pretrained=True)
+        model.Mixed_7c.register_forward_hook(forward_hook)  # 注册前向钩子
+        model.Mixed_7c.register_full_backward_hook(backward_hook)  # 注册反向钩子
+    elif args.model_type == 'res50':
+        model = torchvision.models.resnet50(pretrained=True)
+        model.layer4[-1].register_forward_hook(forward_hook)  # 注册前向钩子
+        model.layer4[-1].register_full_backward_hook(backward_hook)  # 注册反向钩子
+
+    # 加载转移模型（黑盒模型）
+    if args.model_t == 'dense161':
+        model_t = torchvision.models.densenet161(pretrained=True)
+    elif args.model_t == 'vgg16':
+        model_t = torchvision.models.vgg16(pretrained=True)
+    elif args.model_t == 'incv3':
+        model_t = torchvision.models.inception_v3(pretrained=True)
+    elif args.model_t == 'res50':
+        model_t = torchvision.models.resnet50(pretrained=True)
+
+    # 将模型转移到设备并设置为评估模式
+    model_t = model_t.to(device)
+    model_t.eval()
+
+    model = model.to(device)
+    model.eval()
+4. 输入尺寸和网格索引计算
+Python
+    # 根据模型类型设置输入尺寸
+    if args.model_type in ['res50']:
+        scale_size = 256  # 缩放尺寸
+        img_size = 224    # 裁剪尺寸
+        filterSize = 8    # 网格大小
+        stride = 8        # 网格步长
+    else:  # Inception v3
+        scale_size = 300
+        img_size = 299
+        filterSize = 13
+        stride = 13
+        
+    # 计算网格数量
+    P = np.floor((img_size - filterSize) / stride) + 1
+    P = P.astype(np.int32)
+    Q = P  # 网格在高度和宽度方向数量相同
+    
+    # 计算每个网格的像素索引
+    index = np.ones([P * Q, filterSize * filterSize], dtype=int)
+    tmpidx = 0
+    for q in range(Q):
+        plus1 = q * stride * img_size  # 行偏移量
+        for p in range(P):
+            plus2 = p * stride  # 列偏移量
+            index_ = np.array([], dtype=int)
+            for i in range(filterSize):
+                plus = i * img_size + plus1 + plus2
+                index_ = np.append(index_, np.arange(plus, plus + filterSize, dtype=int))
+            index[tmpidx] = index_
+            tmpidx += 1
+    
+    # 将索引扩展为批处理形式并转移到设备
+    index = torch.LongTensor(np.tile(index, (args.batch_size, 1, 1))).to(device)
+5. 生成器加载
+Python
+    # 加载生成器
+    if args.model_type == 'incv3':
+        netG = GeneratorResnet(inception=True, eps=eps / 255.)  # 适应Inception的生成器
+    else:
+        netG = GeneratorResnet(eps=eps / 255.)  # 扰动预算归一化
+    
+    # 加载预训练权重
+    netG.load_state_dict(torch.load(args.checkpoint, map_location='cuda:0'))
+    netG.to(device)
+    netG.eval()  # 设置为评估模式
+6. 数据预处理和加载
+Python
+    # 数据预处理流程
+    data_transform = transforms.Compose([
+        transforms.Resize(scale_size, antialias=True),  # 调整尺寸
+        transforms.CenterCrop(img_size),                # 中心裁剪
+        transforms.ToTensor(),                          # 转为张量
+    ])
+    
+    # Inception模型专用的尺寸调整函数
+    def trans_incep(x):
+        x = F.interpolate(x, size=(299, 299), mode='bilinear', align_corners=False)
+        return x
+    
+    # ImageNet归一化参数
+    mean = [0.485, 0.456, 0.406]
+    std = [0.229, 0.224, 0.225]
+    
+    # 归一化函数
+    def normalize(t):
+        t[:, 0, :, :] = (t[:, 0, :, :] - mean[0]) / std[0]
+        t[:, 1, :, :] = (t[:, 1, :, :] - mean[1]) / std[1]
+        t[:, 2, :, :] = (t[:, 2, :, :] - mean[2]) / std[2]
+        return t
+    
+    # 加载测试集
+    test_set = datasets.ImageFolder(args.test_dir, data_transform)
+    test_loader = torch.utils.data.DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=2,
+                                               pin_memory=True)
+    test_size = len(test_set)
+    print('test data size:', test_size)
+7. 重要区域选择函数
+Python
+    # 基于TopK选择重要区域
+    def grad_topk(grad, index, filterSize, Tk=tk):
+        k = int(((img_size / filterSize) ** 2) * Tk)  # 计算要选择的网格数量
+        box_size = filterSize * filterSize  # 每个网格的像素数
+        
+        for i in range(len(grad)):
+            # 提取每个网格的特征
+            tmp = torch.take(grad[i], index[i])
+            # 计算每个网格特征的范数
+            norm_tmp = torch.norm(tmp, dim=-1)
+            # 选择范数最大的k个网格
+            g_topk = torch.topk(norm_tmp, k=k, dim=-1)
+            # 创建二进制掩码标识重要区域
+            top = g_topk.values.max() + 1
+            norm_tmp_k = norm_tmp.put_(g_topk.indices, torch.FloatTensor([top] * k).to(device))
+            norm_tmp_k = torch.where(norm_tmp_k == top, 1., 0.)
+            # 扩展掩码到像素级别
+            tmp_bi = torch.as_tensor(norm_tmp_k.repeat_interleave(box_size)) * 1.0
+            grad[i] = grad[i].put_(index[i], tmp_bi)
+        return grad
+    
+    # 基于区间选择重要区域
+    def grad_choose(grad, index, filterSize, choose):
+        box_size = filterSize * filterSize
+        for i in range(len(grad)):
+            tmp = torch.take(grad[i], index[i])
+            norm_tmp = torch.norm(tmp, dim=-1)
+            # 按范数排序
+            norm_UD = torch.argsort(norm_tmp, descending=True)
+            norm_len = len(norm_tmp)
+            # 计算选择区间
+            choose_ch = [int(norm_len * choose[0]), int(norm_len * choose[1])]
+            choose_index = norm_UD[choose_ch[0]:choose_ch[1]]
+            # 创建二进制掩码
+            norm_0 = torch.zeros_like(norm_tmp).detach().to(device)
+            norm_0[choose_index] = 1
+            norm_tmp_k = norm_0
+            # 扩展掩码到像素级别
+            tmp_bi = torch.as_tensor(norm_tmp_k.repeat_interleave(box_size)) * 1.0
+            grad[i] = grad[i].put_(index[i], tmp_bi)
+        return grad
+8. 测试过程
+Python
+    # 创建输出目录
+    now = '{}TO{}_eps-{}-K-{}/'.format(args.model_type, args.model_t, eps, tk)
+    now_pic = now + 'pictures/'
+    if not os.path.exists(now):
+        os.mkdir(os.path.join(now))
+        os.mkdir(os.path.join(now_pic))
+    
+    # 初始化评估指标
+    l0, l1, l2, linf = 0, 0, 0, 0
+    FR_bb_epoch, FR_wb_epoch = 0, 0  # 黑盒和白盒攻击成功率
+    
+    # 遍历测试集
+    for i, (img, gt) in enumerate(test_loader):
+        img = img.to(device)
+        gt = gt.to(device)
+        
+        # 白盒模型前向传播
+        if 'inc' in args.model_type or 'xcep' in args.model_type:
+            out = model(normalize(trans_incep(img.clone().detach())))
+        else:
+            out = model(normalize(img.clone().detach()))
+        
+        # 获取原始预测结果
+        label = out.argmax(dim=-1).clone().detach()
+        out_wb = label.clone().detach()
+        
+        # 反向传播获取梯度
+        out.backward(torch.ones_like(out))
+        
+        # 黑盒模型前向传播
+        if 'inc' in args.model_t or 'xcep' in args.model_t:
+            out_bb = model_t(normalize(trans_incep(img.clone().detach())))
+        else:
+            out_bb = model_t(normalize(img.clone().detach()))
+        
+        # 计算结构化掩码
+        grad = back_grad.mean(dim=-1, keepdim=True).mean(dim=-2, keepdim=True)
+        grad_fea = (grad * back_fea).sum(dim=1)
+        resize = transforms.Resize((img_size, img_size), antialias=True)
+        G_F = resize(grad_fea).reshape(len(img), 1, img_size, img_size)
+        
+        # 选择重要区域
+        # grad_box = grad_choose(G_F, index, filterSize, choose)
+        grad_box = grad_topk(G_F, index, filterSize, tk)
+        
+        # 生成对抗样本
+        adv, adv_inf, adv_0, adv_00, grad_img = netG(img, grad_box)
+        adv_img = adv.clone().detach()
+        adv_test = adv.clone().detach()
+        
+        # 白盒模型评估对抗样本
+        if 'inc' in args.model_type or 'xcep' in args.model_type:
+            adv_out = model(normalize(trans_incep(adv.clone().detach())))
+        else:
+            adv_out = model(normalize(adv.clone().detach()))
+        
+        adv_out_to_wb = adv_out.clone().detach()
+        
+        # 黑盒模型评估对抗样本
+        if 'inc' in args.model_t or 'xcep' in args.model_t:
+            adv_out_to_bb = model_t(normalize(trans_incep(adv_test.clone().detach())))
+        else:
+            adv_out_to_bb = model_t(normalize(adv_test.clone().detach()))
+        
+        # 计算攻击成功率
+        if args.target == -1:  # 非目标攻击
+            FR_wb_tmp = torch.sum(adv_out_to_wb.argmax(dim=-1) != out_wb).item()
+            FR_bb_tmp = torch.sum(adv_out_to_bb.argmax(dim=-1) != out_bb.argmax(dim=-1)).item()
+        else:  # 目标攻击
+            FR_wb_tmp = torch.sum(adv_out_to_wb.argmax(dim=-1) == out_wb).item()
+            FR_bb_tmp = torch.sum(adv_out_to_bb.argmax(dim=-1) == out_bb.argmax(dim=-1)).item()
+        
+        # 累计攻击成功率
+        FR_wb_epoch += FR_wb_tmp
+        FR_bb_epoch += FR_bb_tmp
+        
+        # 计算扰动指标
+        l0 += torch.norm(adv_0.clone().detach(), 0).item()  # L0范数（非零元素数量）
+        l1 += torch.norm(adv_0.clone().detach() * adv_inf.clone().detach(), 1).item()  # L1范数
+        l2 += torch.norm(adv_0.clone().detach() * adv_inf.clone().detach(), 2).item()  # L2范数
+        linf = (torch.norm(adv_0.clone().detach() * adv_inf.clone().detach(), p=np.inf)).item()  # L∞范数
+        
+        # 定期保存示例图像
+        if i in [201, 1001, 2001, 3001, 4001]:
+            vutils.save_image(vutils.make_grid(adv_img, normalize=True, scale_each=True),
+                              now_pic + 'adv{}.png'.format(i))
+            vutils.save_image(vutils.make_grid(grad_img, normalize=True, scale_each=True),
+                              now_pic + 'grad_img{}.png'.format(i))
+            vutils.save_image(vutils.make_grid(adv_img - img, normalize=True, scale_each=True),
+                              now_pic + 'noise{}.png'.format(i))
+            vutils.save_image(vutils.make_grid(img, normalize=True, scale_each=True),
+                              now_pic + 'org{}.png'.format(i))
+    
+    # 计算平均指标
+    FR_wb_ep_mean = FR_wb_epoch / test_size
+    FR_bb_ep_mean = FR_bb_epoch / test_size
+    
+    # 输出结果
+    print('FR-{}:{} | FR-{}:{}\n'.format(args.model_type, FR_wb_ep_mean, args.model_t,
+                                         FR_bb_ep_mean))
+    try:
+        print('L0:{}--L1:{:.4f}--L2:{:.4f}--Linf:{:.4f}\n'.format(int(l0 / test_size), l1 / test_size, l2 / test_size,
+                                                                  linf))
+    except:
+        pass
+代码整体流程总结
+初始化设置：
+
+解析命令行参数
+设置计算设备（GPU/CPU）
+定义钩子函数用于捕获模型梯度和特征
+模型加载：
+
+加载白盒目标模型（用于生成对抗样本）
+加载黑盒模型（用于评估转移攻击效果）
+所有模型设为评估模式
+网格索引计算：
+
+根据图像尺寸和网格参数计算每个网格的像素索引
+创建批处理索引张量
+生成器加载：
+
+加载预训练的生成器模型
+设置为评估模式
+数据加载：
+
+加载ImageNet测试集
+定义数据预处理流程和归一化函数
+重要区域选择函数：
+
+基于TopK的梯度重要性选择
+基于区间的梯度重要性选择
+测试循环：
+
+对每个测试样本：
+通过白盒模型获取梯度信息
+计算重要区域掩码
+使用生成器创建对抗样本
+评估白盒攻击成功率
+评估黑盒转移攻击成功率
+计算扰动大小指标（L0, L1, L2, L∞）
+定期保存示例图像
+结果输出：
+
+计算平均攻击成功率
+计算平均扰动大小
+打印最终评估结果
+关键特点和创新点
+结构化稀疏攻击：
+
+不是在整个图像上添加微小扰动，而是在选定的重要区域添加显著扰动
+通过梯度信息识别对模型决策最重要的区域
+双模型评估：
+
+白盒评估：攻击生成对抗样本所用的模型
+黑盒评估：评估对抗样本对未知模型的转移攻击效果
+全面评估方法的有效性
+高效区域选择：
+
+使用TopK方法选择最重要的图像区域
+只修改少量像素，实现高度稀疏的攻击
+全面评估指标：
+
+攻击成功率（白盒和黑盒）
+多种扰动范数（L0, L1, L2, L∞）
+可视化示例输出
+模块化设计：
+
+支持多种模型架构（ResNet, Inception, VGG, DenseNet）
+可配置的攻击参数（扰动大小、区域选择比例等）
+灵活的数据处理流程
+这个测试脚本提供了一个完整的框架，用于评估稀疏对抗样本的生成效果，既可以评估白盒攻击的成功率，也可以测试对抗样本对未知模型的转移攻击能力，同时还能量化扰动的稀疏性和大小。
